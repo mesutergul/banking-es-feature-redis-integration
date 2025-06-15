@@ -1,10 +1,11 @@
 use crate::domain::{Account, AccountEvent};
-use crate::infrastructure::event_store::EventStore;
+use crate::infrastructure::event_store::EventStoreTrait;
 use crate::infrastructure::kafka_abstraction::{KafkaConfig, KafkaConsumer, KafkaProducer};
 use crate::infrastructure::kafka_dlq::DeadLetterQueue;
 use crate::infrastructure::kafka_metrics::KafkaMetrics;
-use crate::infrastructure::projections::ProjectionStore;
+use crate::infrastructure::projections::ProjectionStoreTrait;
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -12,13 +13,17 @@ use tokio::time::sleep;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-#[derive(Clone)]
+#[async_trait]
+pub trait KafkaRecoveryTrait: Send + Sync {
+    async fn start_recovery(&self) -> Result<()>;
+}
+
 pub struct KafkaRecovery {
     producer: KafkaProducer,
     consumer: KafkaConsumer,
-    event_store: EventStore,
-    projections: ProjectionStore,
-    dlq: DeadLetterQueue,
+    event_store: Arc<dyn EventStoreTrait + Send + Sync>,
+    projections: Arc<dyn ProjectionStoreTrait + Send + Sync>,
+    dlq: Arc<DeadLetterQueue>,
     metrics: Arc<KafkaMetrics>,
     recovery_state: Arc<RwLock<RecoveryState>>,
 }
@@ -35,9 +40,9 @@ impl KafkaRecovery {
     pub fn new(
         producer: KafkaProducer,
         consumer: KafkaConsumer,
-        event_store: EventStore,
-        projections: ProjectionStore,
-        dlq: DeadLetterQueue,
+        event_store: Arc<dyn EventStoreTrait + Send + Sync>,
+        projections: Arc<dyn ProjectionStoreTrait + Send + Sync>,
+        dlq: Arc<DeadLetterQueue>,
         metrics: Arc<KafkaMetrics>,
     ) -> Self {
         Self {
@@ -47,7 +52,12 @@ impl KafkaRecovery {
             projections,
             dlq,
             metrics,
-            recovery_state: Arc::new(RwLock::new(RecoveryState::default())),
+            recovery_state: Arc::new(RwLock::new(RecoveryState {
+                is_recovering: false,
+                last_processed_offset: 0,
+                recovery_start_time: None,
+                accounts_in_recovery: Vec::new(),
+            })),
         }
     }
 
@@ -248,6 +258,21 @@ impl KafkaRecovery {
                 .map(|start| start.elapsed())
                 .unwrap_or(Duration::from_secs(0)),
         }
+    }
+}
+
+#[async_trait]
+impl KafkaRecoveryTrait for KafkaRecovery {
+    async fn start_recovery(&self) -> Result<()> {
+        let mut state = self.recovery_state.write().await;
+        if state.is_recovering {
+            return Ok(());
+        }
+        state.is_recovering = true;
+        state.recovery_start_time = Some(std::time::Instant::now());
+        drop(state);
+
+        self.perform_recovery().await
     }
 }
 

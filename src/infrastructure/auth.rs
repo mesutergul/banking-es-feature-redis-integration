@@ -1,3 +1,4 @@
+use crate::infrastructure::user_repository::{NewUser, User, UserRepository, UserRepositoryError};
 use argon2::{
     password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
@@ -14,19 +15,20 @@ use axum_extra::{
     headers::{authorization::Bearer, Authorization},
     TypedHeader,
 };
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc}; // use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
-use redis::{aio::Connection, AsyncCommands, RedisError};
+use redis::{AsyncCommands, RedisError};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::fmt::Display;
 use std::future::Future;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::LazyLock;
+use strum_macros::{EnumString, ToString};
 use thiserror::Error;
 use tokio::sync::RwLock;
 use uuid::Uuid;
-
 static KEYS: LazyLock<Keys> = LazyLock::new(|| {
     let secret = std::env::var("JWT_SECRET").expect("JWT_SECRET must be set");
     Keys::new(secret.as_bytes())
@@ -60,11 +62,35 @@ pub enum AuthError {
     MissingCredentials,
     #[error("Token creation error")]
     TokenCreation,
+    #[error("Username '{0}' already exists")]
+    UsernameAlreadyExists(String),
+    #[error("Email '{0}' already exists")]
+    EmailAlreadyExists(String),
+    #[error("User repository error: {0}")]
+    UserRepositoryError(String),
+    #[error("Account is locked")]
+    AccountLocked,
 }
 
+impl From<UserRepositoryError> for AuthError {
+    fn from(err: UserRepositoryError) -> Self {
+        match err {
+            UserRepositoryError::NotFoundById(_) => AuthError::UserNotFound,
+            UserRepositoryError::NotFoundByUsername(_) => AuthError::UserNotFound,
+            UserRepositoryError::UsernameExists(username) => {
+                AuthError::UsernameAlreadyExists(username)
+            }
+            UserRepositoryError::EmailExists(email) => AuthError::EmailAlreadyExists(email),
+            UserRepositoryError::DatabaseError(db_err) => {
+                AuthError::UserRepositoryError(db_err.to_string())
+            }
+            UserRepositoryError::Unexpected(msg) => AuthError::InternalError(msg),
+        }
+    }
+}
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Claims {
-    pub sub: String,
+    pub sub: String, // username
     pub exp: i64,
     pub iat: i64,
     pub roles: Vec<UserRole>,
@@ -73,29 +99,19 @@ pub struct Claims {
     pub company: String,
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Copy, ToString, EnumString)]
+#[strum(serialize_all = "snake_case")]
 pub enum TokenType {
     Access,
     Refresh,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, ToString, EnumString)]
+#[strum(serialize_all = "snake_case")]
 pub enum UserRole {
     Admin,
     BankManager,
     Customer,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct User {
-    pub id: String,
-    pub username: String,
-    pub password_hash: String,
-    pub roles: Vec<UserRole>,
-    pub is_active: bool,
-    pub last_login: Option<DateTime<Utc>>,
-    pub failed_login_attempts: u32,
-    pub locked_until: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone)]
@@ -157,30 +173,37 @@ pub struct LogoutRequest {
 pub struct AuthService {
     redis_client: Arc<redis::Client>,
     config: AuthConfig,
-    users: Arc<RwLock<Vec<User>>>,
+    // users: Arc<RwLock<Vec<User>>>,
+    user_repository: Arc<UserRepository>,
 }
 
 impl AuthService {
-    pub fn new(redis_client: Arc<redis::Client>, config: AuthConfig) -> Self {
+    pub fn new(
+        redis_client: Arc<redis::Client>,
+        config: AuthConfig,
+        user_repository: Arc<UserRepository>,
+    ) -> Self {
         Self {
             redis_client,
             config,
-            users: Arc::new(RwLock::new(Vec::new())),
+            // users: Arc::new(RwLock::new(Vec::new())),
+            user_repository,
         }
     }
 
     pub async fn register_user(
         &self,
         username: &str,
+        email: &str,
         password: &str,
         roles: Vec<UserRole>,
     ) -> Result<User, AuthError> {
-        let mut users = self.users.write().await;
+        // let mut users = self.user_repository.write().await;
 
-        // Check if username already exists
-        if users.iter().any(|u| u.username == username) {
-            return Err(AuthError::InternalError("Username already exists".into()));
-        }
+        // // Check if username already exists
+        // if users.iter().any(|u| u.username == username) {
+        //     return Err(AuthError::InternalError("Username already exists".into()));
+        // }
 
         // Hash password
         let salt = SaltString::generate(&mut OsRng);
@@ -190,36 +213,59 @@ impl AuthService {
             .map_err(|e| AuthError::PasswordHashError(e.to_string()))?
             .to_string();
 
-        let user = User {
-            id: Uuid::new_v4().to_string(),
-            username: username.to_string(),
+        // let user = User {
+        //     id: Uuid::new_v4().to_string(),
+        //     username: username.to_string(),
+        //     password_hash,
+        //     roles,
+        //     is_active: true,
+        //     last_login: None,
+        //     failed_login_attempts: 0,
+        //     locked_until: None,
+        // };
+        let user = NewUser {
+            username,
+            email,
             password_hash,
-            roles,
-            is_active: true,
-            last_login: None,
-            failed_login_attempts: 0,
-            locked_until: None,
+            roles: roles.iter().map(|r| r.to_string()).collect(),
+            // is_active: Some(true),
         };
 
-        users.push(user.clone());
+        // users.push(user.clone());
+        let user = self.user_repository.create(&user).await?;
         Ok(user)
     }
 
     pub async fn login(&self, username: &str, password: &str) -> Result<LoginResponse, AuthError> {
-        let mut users = self.users.write().await;
-        let user = users
-            .iter_mut()
-            .find(|u| u.username == username)
+        // let mut users = self.users.write().await;
+        // let user = users
+        //     .iter_mut()
+        //     .find(|u| u.username == username)
+        let user = self
+            .user_repository
+            .find_by_username(username)
+            .await?
             .ok_or(AuthError::UserNotFound)?;
-
-        // Check if account is locked
-        if let Some(locked_until) = user.locked_until {
-            if Utc::now() < locked_until {
+        if !user.is_active {
+            return Err(AuthError::InternalError("Account is not active".into()));
+        }
+        if let Some(locked_until_ts) = user.locked_until {
+            if Utc::now() < locked_until_ts {
                 return Err(AuthError::InternalError("Account is locked".into()));
             }
-            user.locked_until = None;
-            user.failed_login_attempts = 0;
+            self.user_repository
+                .update_lockout(user.id, None, 0)
+                .await?;
         }
+
+        // Check if account is locked
+        // if let Some(locked_until) = user.locked_until {
+        //     if Utc::now() < locked_until {
+        //         return Err(AuthError::InternalError("Account is locked".into()));
+        //     }
+        //     user.locked_until = None;
+        //     user.failed_login_attempts = 0;
+        // }
 
         // Verify password
         let parsed_hash = PasswordHash::new(&user.password_hash)
@@ -229,28 +275,50 @@ impl AuthService {
             .verify_password(password.as_bytes(), &parsed_hash)
             .is_ok()
         {
-            user.failed_login_attempts += 1;
-            if user.failed_login_attempts >= self.config.max_failed_attempts {
-                user.locked_until = Some(
-                    Utc::now() + Duration::minutes(self.config.lockout_duration_minutes as i64),
-                );
-                return Err(AuthError::InternalError(
-                    "Account locked due to too many failed attempts".into(),
-                ));
+            // user.failed_login_attempts += 1;
+            // if user.failed_login_attempts >= self.config.max_failed_attempts {
+            //     user.locked_until = Some(
+            //         Utc::now() + Duration::minutes(self.config.lockout_duration_minutes as i64),
+            //     );
+            //     return Err(AuthError::InternalError(
+            //         "Account locked due to too many failed attempts".into(),
+            //     ));
+            let new_failed_attempts = self
+                .user_repository
+                .increment_failed_attempts(user.id)
+                .await?;
+            if new_failed_attempts >= self.config.max_failed_attempts.try_into().unwrap() {
+                let locked_until = Utc::now()
+                    + ChronoDuration::minutes(self.config.lockout_duration_minutes.into());
+
+                self.user_repository
+                    .update_lockout(user.id, Some(locked_until), new_failed_attempts)
+                    .await?;
+
+                return Err(AuthError::AccountLocked);
             }
             return Err(AuthError::InvalidCredentials);
         }
 
         // Reset failed attempts and update last login
-        user.failed_login_attempts = 0;
-        user.last_login = Some(Utc::now());
+        // user.failed_login_attempts = 0;
+        // user.last_login = Some(Utc::now());
+        // Reset failed attempts and update last login on successful loginAdd commentMore actions
 
+        self.user_repository
+            .update_login_info(user.id, Utc::now(), 0, None)
+            .await?;
+        let user_roles: Vec<UserRole> = user
+            .roles
+            .iter()
+            .map(|s| UserRole::from_str(s).unwrap_or(UserRole::Customer)) // Default to Customer on parse error
+            .collect();
         // Generate tokens
         let access_token = self
-            .generate_token(username, &user.roles, TokenType::Access)
+            .generate_token(&user.username, &user_roles, TokenType::Access)
             .await?;
         let refresh_token = self
-            .generate_token(username, &user.roles, TokenType::Refresh)
+            .generate_token(&user.username, &user_roles, TokenType::Refresh)
             .await?;
 
         Ok(LoginResponse {
@@ -258,28 +326,36 @@ impl AuthService {
             refresh_token,
             token_type: "Bearer".to_string(),
             expires_in: self.config.access_token_expiry,
-            user_id: user.id.clone(),
-            roles: user.roles.clone(),
+            user_id: user.id.to_string(),
+            roles: user_roles,
         })
     }
 
-    pub async fn refresh_token(&self, refresh_token: &str) -> Result<LoginResponse, AuthError> {
+    pub async fn refresh_token(&self, refresh_token_str: &str) -> Result<LoginResponse, AuthError> {
         let claims = self
-            .validate_token(refresh_token, TokenType::Refresh)
+            .validate_token(refresh_token_str, TokenType::Refresh)
             .await?;
 
-        let users = self.users.read().await;
-        let user = users
-            .iter()
-            .find(|u| u.username == claims.sub)
+        let user = self
+            .user_repository
+            .find_by_username(&claims.sub)
+            .await?
             .ok_or(AuthError::UserNotFound)?;
 
-        // Generate new tokens
+        if !user.is_active {
+            return Err(AuthError::InternalError("Account is inactive".into()));
+        }
+        let user_roles: Vec<UserRole> = user
+            .roles
+            .iter()
+            .map(|s| UserRole::from_str(s).unwrap_or(UserRole::Customer))
+            .collect();
+
         let access_token = self
-            .generate_token(&user.username, &user.roles, TokenType::Access)
+            .generate_token(&user.username, &user_roles, TokenType::Access)
             .await?;
         let new_refresh_token = self
-            .generate_token(&user.username, &user.roles, TokenType::Refresh)
+            .generate_token(&user.username, &user_roles, TokenType::Refresh)
             .await?;
 
         Ok(LoginResponse {
@@ -287,8 +363,8 @@ impl AuthService {
             refresh_token: new_refresh_token,
             token_type: "Bearer".to_string(),
             expires_in: self.config.access_token_expiry,
-            user_id: user.id.clone(),
-            roles: user.roles.clone(),
+            user_id: user.id.to_string(),
+            roles: user_roles,
         })
     }
 
@@ -298,10 +374,10 @@ impl AuthService {
         current_password: &str,
         new_password: &str,
     ) -> Result<(), AuthError> {
-        let mut users = self.users.write().await;
-        let user = users
-            .iter_mut()
-            .find(|u| u.username == username)
+        let user = self
+            .user_repository
+            .find_by_username(username)
+            .await?
             .ok_or(AuthError::UserNotFound)?;
 
         // Verify current password
@@ -323,39 +399,42 @@ impl AuthService {
             .map_err(|e| AuthError::PasswordHashError(e.to_string()))?
             .to_string();
 
-        user.password_hash = new_password_hash;
+        // user.password_hash = new_password_hash;
+        self.user_repository
+            .update_password_hash(user.id, &new_password_hash)
+            .await?;
         Ok(())
     }
 
-    pub async fn request_password_reset(
-        &self,
-        email: &str,
-    ) -> Result<PasswordResetResponse, AuthError> {
-        let users = self.users.read().await;
-        let user = users
-            .iter()
-            .find(|u| u.username == email)
-            .ok_or(AuthError::UserNotFound)?;
+    // pub async fn request_password_reset(
+    //     &self,
+    //     email: &str,
+    // ) -> Result<PasswordResetResponse, AuthError> {
+    //     let users = self.users.read().await;
+    //     let user = users
+    //         .iter()
+    //         .find(|u| u.username == email)
+    //         .ok_or(AuthError::UserNotFound)?;
 
-        // Generate reset token
-        let reset_token = self
-            .generate_token(&user.username, &user.roles, TokenType::Access)
-            .await?;
+    //     // Generate reset token
+    //     let reset_token = self
+    //         .generate_token(&user.username, &user.roles, TokenType::Access)
+    //         .await?;
 
-        // Store reset token in Redis with expiration
-        let mut conn = self.redis_client.get_async_connection().await?;
-        conn.set_ex(
-            format!("reset_token:{}", user.id),
-            &reset_token,
-            self.config.access_token_expiry as u64,
-        )
-        .await?;
+    //     // Store reset token in Redis with expiration
+    //     let mut conn = self.redis_client.get_async_connection().await?;
+    //     conn.set_ex(
+    //         format!("reset_token:{}", user.id),
+    //         &reset_token,
+    //         self.config.access_token_expiry as u64,
+    //     )
+    //     .await?;
 
-        Ok(PasswordResetResponse {
-            reset_token,
-            expires_in: self.config.access_token_expiry,
-        })
-    }
+    //     Ok(PasswordResetResponse {
+    //         reset_token,
+    //         expires_in: self.config.access_token_expiry,
+    //     })
+    // }
 
     async fn generate_token(
         &self,
@@ -364,14 +443,14 @@ impl AuthService {
         token_type: TokenType,
     ) -> Result<String, AuthError> {
         let now = Utc::now();
-        let exp = match token_type {
-            TokenType::Access => now + Duration::seconds(self.config.access_token_expiry),
-            TokenType::Refresh => now + Duration::seconds(self.config.refresh_token_expiry),
+        let exp_duration = match token_type {
+            TokenType::Access => ChronoDuration::seconds(self.config.access_token_expiry),
+            TokenType::Refresh => ChronoDuration::seconds(self.config.refresh_token_expiry),
         };
-
+        let exp = (now + exp_duration).timestamp();
         let claims = Claims {
             sub: username.to_string(),
-            exp: exp.timestamp(),
+            exp,
             iat: now.timestamp(),
             roles: roles.to_vec(),
             token_type,
@@ -379,7 +458,7 @@ impl AuthService {
             company: "ACME".to_string(),
         };
 
-        let secret = match claims.token_type {
+        let secret_key = match claims.token_type {
             TokenType::Access => &self.config.jwt_secret,
             TokenType::Refresh => &self.config.refresh_token_secret,
         };
@@ -387,9 +466,9 @@ impl AuthService {
         encode(
             &Header::default(),
             &claims,
-            &EncodingKey::from_secret(secret.as_bytes()),
+            &EncodingKey::from_secret(secret_key.as_bytes()),
         )
-        .map_err(AuthError::from)
+        .map_err(AuthError::JwtError)
     }
 
     pub async fn validate_token(
@@ -464,24 +543,27 @@ impl AuthService {
 }
 
 // Add Default implementation for AuthService
-impl Default for AuthService {
-    fn default() -> Self {
-        let redis_client = Arc::new(
-            redis::Client::open("redis://localhost:6379").expect("Failed to connect to Redis"),
-        );
-        let auth_config = AuthConfig {
-            jwt_secret: "default_secret".to_string(),
-            refresh_token_secret: "default_refresh_secret".to_string(),
-            access_token_expiry: 3600,
-            refresh_token_expiry: 604800,
-            rate_limit_requests: 100,
-            rate_limit_window: 60,
-            max_failed_attempts: 5,
-            lockout_duration_minutes: 30,
-        };
-        AuthService::new(redis_client, auth_config)
-    }
-}
+// impl Default for AuthService {
+//     fn default() -> Self {
+//         let redis_client = Arc::new(
+//             redis::Client::open("redis://localhost:6379").expect("Failed to connect to Redis"),
+//         );
+//         let auth_config = AuthConfig {
+//             jwt_secret: "default_secret".to_string(),
+//             refresh_token_secret: "default_refresh_secret".to_string(),
+//             access_token_expiry: 3600,
+//             refresh_token_expiry: 604800,
+//             rate_limit_requests: 100,
+//             rate_limit_window: 60,
+//             max_failed_attempts: 5,
+//             lockout_duration_minutes: 30,
+//         };
+//         let user_repository = Arc::new(UserRepository::new(
+//             "postgres://postgres:postgres@localhost:5432/postgres".to_string(),
+//         ));
+//         AuthService::new(redis_client, auth_config, user_repository)
+//     }
+// }
 
 #[async_trait]
 impl<S> FromRequestParts<S> for Claims
@@ -512,25 +594,59 @@ where
 
 impl IntoResponse for AuthError {
     fn into_response(self) -> Response {
-        let (status, error_message) = match self {
-            AuthError::InvalidCredentials => (StatusCode::UNAUTHORIZED, "Invalid credentials"),
-            AuthError::TokenExpired => (StatusCode::UNAUTHORIZED, "Token expired"),
-            AuthError::InvalidToken => (StatusCode::UNAUTHORIZED, "Invalid token"),
-            AuthError::TokenBlacklisted => (StatusCode::UNAUTHORIZED, "Token has been revoked"),
-            AuthError::RateLimitExceeded => (StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded"),
-            AuthError::UserNotFound => (StatusCode::NOT_FOUND, "User not found"),
+        let (status, error_message) = match &self {
+            AuthError::InvalidCredentials => {
+                (StatusCode::UNAUTHORIZED, "Invalid credentials".to_string())
+            }
+            AuthError::TokenExpired => (StatusCode::UNAUTHORIZED, "Token expired".to_string()),
+            AuthError::InvalidToken => (StatusCode::UNAUTHORIZED, "Invalid token".to_string()),
+            AuthError::TokenBlacklisted => (
+                StatusCode::UNAUTHORIZED,
+                "Token has been revoked".to_string(),
+            ),
+            AuthError::RateLimitExceeded => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "Rate limit exceeded".to_string(),
+            ),
+            AuthError::UserNotFound => (StatusCode::NOT_FOUND, "User not found".to_string()),
             AuthError::PasswordHashError(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "Password processing error",
+                "Password processing error".to_string(),
             ),
-            AuthError::RedisError(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Database error"),
-            AuthError::JwtError(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Token processing error"),
-            AuthError::InternalError(_) => {
-                (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
+            AuthError::RedisError(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Database error".to_string(),
+            ),
+            AuthError::JwtError(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Token processing error".to_string(),
+            ),
+            AuthError::InternalError(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal server error".to_string(),
+            ),
+            AuthError::WrongCredentials => {
+                (StatusCode::UNAUTHORIZED, "Wrong credentials".to_string())
             }
-            AuthError::WrongCredentials => (StatusCode::UNAUTHORIZED, "Wrong credentials"),
-            AuthError::MissingCredentials => (StatusCode::BAD_REQUEST, "Missing credentials"),
-            AuthError::TokenCreation => (StatusCode::INTERNAL_SERVER_ERROR, "Token creation error"),
+            AuthError::MissingCredentials => {
+                (StatusCode::BAD_REQUEST, "Missing credentials".to_string())
+            }
+            AuthError::TokenCreation => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Token creation error".to_string(),
+            ),
+            AuthError::UsernameAlreadyExists(_) => (
+                StatusCode::BAD_REQUEST,
+                "Username already exists".to_string(),
+            ),
+            AuthError::EmailAlreadyExists(_) => {
+                (StatusCode::BAD_REQUEST, "Email already exists".to_string())
+            }
+            AuthError::UserRepositoryError(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Database error".to_string(),
+            ),
+            AuthError::AccountLocked => (StatusCode::UNAUTHORIZED, "Account is locked".to_string()),
         };
 
         let body = Json(serde_json::json!({

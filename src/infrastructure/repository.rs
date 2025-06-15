@@ -1,6 +1,6 @@
 use crate::domain::{Account, AccountError, AccountEvent};
 use crate::infrastructure::cache_service::{CacheConfig, CacheService, EvictionPolicy};
-use crate::infrastructure::event_store::{EventStore, EventStoreConfig};
+use crate::infrastructure::event_store::{EventPriority, EventStore, EventStoreTrait};
 use crate::infrastructure::kafka_abstraction::KafkaConfig;
 use crate::infrastructure::kafka_event_processor::KafkaEventProcessor;
 use crate::infrastructure::projections::ProjectionStore;
@@ -9,9 +9,10 @@ use anyhow::Result;
 use async_trait::async_trait;
 use rust_decimal::Decimal;
 use sqlx::postgres::PgPoolOptions;
-use std::sync::Arc;
-use std::time::Duration;
-use tracing::error;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 #[derive(Debug, thiserror::Error)]
@@ -44,45 +45,53 @@ pub trait AccountRepositoryTrait: Send + Sync {
     fn start_batch_flush_task(&self);
 }
 
+#[derive(Debug, Clone)]
+struct CacheEntry<T> {
+    data: T,
+    created_at: Instant,
+    last_accessed: Instant,
+    version: i64,
+}
+
+#[derive(Debug, Default)]
+struct RepositoryMetrics {
+    cache_hits: std::sync::atomic::AtomicU64,
+    cache_misses: std::sync::atomic::AtomicU64,
+    batch_flushes: std::sync::atomic::AtomicU64,
+    events_processed: std::sync::atomic::AtomicU64,
+    errors: std::sync::atomic::AtomicU64,
+}
+
+#[derive(Clone)]
 pub struct AccountRepository {
-    event_store: EventStore,
-    kafka_processor: Arc<KafkaEventProcessor>,
+    event_store: Arc<dyn EventStoreTrait + 'static>,
+    pending_events: Arc<Mutex<HashMap<Uuid, Vec<AccountEvent>>>>,
+    account_cache: Arc<RwLock<HashMap<Uuid, CacheEntry<Account>>>>,
+    flush_interval: Duration,
+    metrics: Arc<RepositoryMetrics>,
 }
 
 impl AccountRepository {
-    pub fn new(
-        event_store: EventStore,
-        kafka_config: KafkaConfig,
-        projections: ProjectionStore,
-        redis_client: redis::Client,
-    ) -> Result<Self> {
-        let cache_config = CacheConfig {
-            default_ttl: Duration::from_secs(3600), // 1 hour
-            max_size: 10000,
-            shard_count: 4,
-            warmup_batch_size: 100,
-            warmup_interval: Duration::from_secs(300), // 5 minutes
-            eviction_policy: EvictionPolicy::LRU,
+    pub fn new(event_store: Arc<dyn EventStoreTrait + 'static>) -> Self {
+        let repo = Self {
+            event_store,
+            pending_events: Arc::new(Mutex::new(HashMap::new())),
+            account_cache: Arc::new(RwLock::new(HashMap::new())),
+            flush_interval: Duration::from_millis(50),
+            metrics: Arc::new(RepositoryMetrics::default()),
         };
 
-        let redis_client = RealRedisClient::new(redis_client, None);
-        let cache_service = CacheService::new(redis_client, cache_config);
-        let kafka_processor = Arc::new(KafkaEventProcessor::new(
-            kafka_config,
-            event_store.clone(),
-            projections.clone(),
-            cache_service,
-        )?);
+        repo.start_batch_flush_task();
+        repo.start_metrics_reporter();
 
-        Ok(Self {
-            event_store,
-            kafka_processor,
-        })
+        repo
     }
 
     pub async fn save(&self, account: &Account, events: Vec<AccountEvent>) -> Result<()> {
-        self.kafka_processor.start_processing().await?;
-        Ok(())
+        Ok(self
+            .event_store
+            .save_events(account.id, events, account.version)
+            .await?)
     }
 
     pub async fn get_by_id(&self, id: Uuid) -> Result<Option<Account>, AccountError> {
@@ -104,6 +113,40 @@ impl AccountRepository {
             account.apply_event(&account_event);
         }
         Ok(Some(account))
+    }
+
+    fn start_metrics_reporter(&self) {
+        let metrics = Arc::clone(&self.metrics);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                let hits = metrics
+                    .cache_hits
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let misses = metrics
+                    .cache_misses
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let flushes = metrics
+                    .batch_flushes
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let processed = metrics
+                    .events_processed
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let errors = metrics.errors.load(std::sync::atomic::Ordering::Relaxed);
+
+                let hit_rate = if hits + misses > 0 {
+                    (hits as f64 / (hits + misses) as f64) * 100.0
+                } else {
+                    0.0
+                };
+
+                info!(
+                    "Repository Metrics - Cache Hit Rate: {:.1}%, Batch Flushes: {}, Events Processed: {}, Errors: {}",
+                    hit_rate, flushes, processed, errors
+                );
+            }
+        });
     }
 }
 
@@ -134,8 +177,10 @@ impl AccountRepositoryTrait for AccountRepository {
     }
 
     async fn save_immediate(&self, account: &Account, events: Vec<AccountEvent>) -> Result<()> {
-        self.kafka_processor.start_processing().await?;
-        Ok(())
+        Ok(self
+            .event_store
+            .save_events(account.id, events, account.version)
+            .await?)
     }
 
     async fn save(&self, account: &Account, events: Vec<AccountEvent>) -> Result<()> {
@@ -152,8 +197,10 @@ impl AccountRepositoryTrait for AccountRepository {
         expected_version: i64,
         events: Vec<AccountEvent>,
     ) -> Result<()> {
-        self.kafka_processor.start_processing().await?;
-        Ok(())
+        Ok(self
+            .event_store
+            .save_events(account_id, events, expected_version)
+            .await?)
     }
 
     async fn flush_all(&self) -> Result<()> {
@@ -171,14 +218,10 @@ mod tests {
     use super::*;
     use crate::domain::Account;
     use crate::infrastructure::event_store::EventStore;
-    use crate::infrastructure::kafka_abstraction::KafkaConfig;
-    use crate::infrastructure::projections::ProjectionStore;
-    use sqlx::postgres::PgPoolOptions;
-    use uuid::Uuid;
+    use std::sync::Arc;
 
     #[tokio::test]
     async fn test_get_by_id_not_found() {
-        // Create test database pools
         let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
             "postgresql://postgres:Francisco1@localhost:5432/banking_es".to_string()
         });
@@ -189,12 +232,8 @@ mod tests {
             .await
             .expect("Failed to create test database pool");
 
-        let event_store = EventStore::new(pool.clone());
-        let kafka_config = KafkaConfig::default();
-        let projections = ProjectionStore::new(pool);
-        let redis_client = redis::Client::open("redis://127.0.0.1/").unwrap();
-        let repo =
-            AccountRepository::new(event_store, kafka_config, projections, redis_client).unwrap();
+        let event_store = Arc::new(EventStore::new(pool)) as Arc<dyn EventStoreTrait + 'static>;
+        let repo = AccountRepository::new(event_store);
         let id = Uuid::new_v4();
         let result = repo.get_by_id(id).await;
         assert!(result.is_ok());
@@ -204,16 +243,7 @@ mod tests {
 
 impl Default for AccountRepository {
     fn default() -> Self {
-        // Create a default configuration that doesn't require async initialization
-        let event_store = EventStore::default();
-        let kafka_config = KafkaConfig::default();
-        let projection_store = ProjectionStore::default();
-        let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-            "postgresql://postgres:Francisco1@localhost:5432/banking_es".to_string()
-        });
-        let redis_client =
-            redis::Client::open("redis://localhost:6379").expect("Failed to connect to Redis");
-        AccountRepository::new(event_store, kafka_config, projection_store, redis_client)
-            .expect("Failed to create AccountRepository")
+        let event_store = Arc::new(EventStore::default()) as Arc<dyn EventStoreTrait + 'static>;
+        AccountRepository::new(event_store)
     }
 }

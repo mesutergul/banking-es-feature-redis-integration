@@ -5,7 +5,10 @@ use ::banking_es::{
     AccountError, AccountRepository, AccountRepositoryTrait, AccountService, EventStore,
     EventStoreConfig, ProjectionStore,
 };
-use banking_es::KafkaConfig;
+use anyhow::Result;
+use banking_es::infrastructure::cache_service::CacheServiceTrait;
+use banking_es::infrastructure::event_store::EventStoreTrait;
+use banking_es::infrastructure::projections::ProjectionStoreTrait;
 use dotenv;
 use redis;
 use rust_decimal::Decimal;
@@ -18,7 +21,7 @@ use uuid::Uuid;
 
 // Helper structure to hold common test dependencies
 struct TestContext {
-    account_service: AccountService,
+    account_service: Arc<AccountService>,
     account_repository: Arc<AccountRepository>,
     db_pool: PgPool,
 }
@@ -37,23 +40,21 @@ async fn setup_test_environment() -> Result<TestContext, Box<dyn std::error::Err
     let projection_store = ProjectionStore::new(db_pool.clone());
 
     // Setup Repository and Service
-    let account_repository = Arc::new(AccountRepository::new(
-        event_store,
-        KafkaConfig::default(),
-        projection_store.clone(),
-        redis::Client::open("redis://localhost:6379").expect("Failed to connect to Redis"),
-    )?);
-    let account_service = AccountService::new(
-        account_repository.clone(),
-        projection_store,
-        CacheService::default(),
+    let event_store = Arc::new(event_store) as Arc<dyn EventStoreTrait + 'static>;
+    let account_repository: Arc<AccountRepository> = Arc::new(AccountRepository::new(event_store));
+    let account_repository_clone = account_repository.clone();
+
+    let service = Arc::new(AccountService::new(
+        account_repository,
+        Arc::new(projection_store) as Arc<dyn ProjectionStoreTrait + 'static>,
+        Arc::new(CacheService::default()) as Arc<dyn CacheServiceTrait + 'static>,
         Arc::new(RequestMiddleware::default()),
         100,
-    );
+    ));
 
     Ok(TestContext {
-        account_service,
-        account_repository,
+        account_service: service.clone(),
+        account_repository: account_repository_clone,
         db_pool,
     })
 }

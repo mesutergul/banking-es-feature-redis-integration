@@ -2,13 +2,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::domain::{Account, AccountCommand, AccountError, AccountEvent};
-use crate::infrastructure::cache_service::CacheService;
+use crate::infrastructure::cache_service::{CacheService, CacheServiceTrait};
 use crate::infrastructure::middleware::RequestMiddleware;
+use crate::infrastructure::projections::ProjectionStoreTrait;
 use crate::infrastructure::projections::{AccountProjection, TransactionProjection};
 use crate::infrastructure::repository::AccountRepositoryTrait;
-use crate::infrastructure::{
-    AccountRepository, EventStore, EventStoreConfig, ProjectionStore, RealRedisClient,
-};
+use crate::infrastructure::{AccountRepository, EventStore, EventStoreConfig, ProjectionStore};
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Utc;
@@ -29,10 +28,11 @@ pub struct ServiceMetrics {
     pub cache_misses: std::sync::atomic::AtomicU64,
 }
 
+#[derive(Clone)]
 pub struct AccountService {
     repository: Arc<dyn AccountRepositoryTrait + 'static>,
-    projections: ProjectionStore,
-    cache_service: CacheService,
+    projections: Arc<dyn ProjectionStoreTrait + 'static>,
+    cache_service: Arc<dyn CacheServiceTrait + 'static>,
     metrics: Arc<ServiceMetrics>,
     command_cache: Arc<RwLock<std::collections::HashMap<Uuid, Instant>>>,
     pub middleware: Arc<RequestMiddleware>,
@@ -52,8 +52,8 @@ impl AccountService {
     /// * `max_requests_per_second`: The maximum number of requests per second allowed.
     pub fn new(
         repository: Arc<dyn AccountRepositoryTrait + 'static>,
-        projections: ProjectionStore,
-        cache_service: CacheService,
+        projections: Arc<dyn ProjectionStoreTrait + 'static>,
+        cache_service: Arc<dyn CacheServiceTrait + 'static>,
         middleware: Arc<RequestMiddleware>,
         max_requests_per_second: usize,
     ) -> Self {
@@ -448,8 +448,10 @@ impl From<AccountEvent> for TransactionProjection {
 impl Default for AccountService {
     fn default() -> Self {
         let repository = Arc::new(AccountRepository::default());
-        let projection_store = ProjectionStore::default();
-        let cache_service = CacheService::default();
+        let projection_store =
+            Arc::new(ProjectionStore::default()) as Arc<dyn ProjectionStoreTrait + 'static>;
+        let cache_service =
+            Arc::new(CacheService::default()) as Arc<dyn CacheServiceTrait + 'static>;
         let middleware = Arc::new(RequestMiddleware::default());
         AccountService::new(repository, projection_store, cache_service, middleware, 100)
     }
@@ -540,8 +542,10 @@ mod tests {
     fn account_service_with_mock_repo(
         mock_repo: Arc<dyn AccountRepositoryTrait + 'static>,
     ) -> AccountService {
-        let projection_store = ProjectionStore::default();
-        let cache_service = CacheService::default();
+        let projection_store =
+            Arc::new(ProjectionStore::default()) as Arc<dyn ProjectionStoreTrait + 'static>;
+        let cache_service =
+            Arc::new(CacheService::default()) as Arc<dyn CacheServiceTrait + 'static>;
         AccountService::new(
             mock_repo,
             projection_store,

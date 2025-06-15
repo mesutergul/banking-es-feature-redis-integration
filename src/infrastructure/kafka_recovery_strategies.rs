@@ -1,5 +1,5 @@
 use crate::domain::{Account, AccountEvent};
-use crate::infrastructure::event_store::EventStore;
+use crate::infrastructure::event_store::{EventStore, EventStoreTrait};
 use crate::infrastructure::kafka_abstraction::{KafkaConfig, KafkaConsumer, KafkaProducer};
 use crate::infrastructure::kafka_dlq::DeadLetterQueue;
 use crate::infrastructure::kafka_metrics::KafkaMetrics;
@@ -20,19 +20,19 @@ pub enum RecoveryStrategy {
 }
 
 pub struct RecoveryStrategies {
-    event_store: EventStore,
+    event_store: Arc<dyn EventStoreTrait + Send + Sync>,
     producer: KafkaProducer,
     consumer: KafkaConsumer,
-    dlq: DeadLetterQueue,
+    dlq: Arc<DeadLetterQueue>,
     metrics: Arc<KafkaMetrics>,
 }
 
 impl RecoveryStrategies {
     pub fn new(
-        event_store: EventStore,
+        event_store: Arc<dyn EventStoreTrait + Send + Sync>,
         producer: KafkaProducer,
         consumer: KafkaConsumer,
-        dlq: DeadLetterQueue,
+        dlq: Arc<DeadLetterQueue>,
         metrics: Arc<KafkaMetrics>,
     ) -> Self {
         Self {

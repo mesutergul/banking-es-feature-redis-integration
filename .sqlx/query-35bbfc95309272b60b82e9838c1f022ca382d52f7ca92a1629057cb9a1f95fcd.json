@@ -1,0 +1,41 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                SELECT\n                    e.aggregate_id,\n                    COUNT(e.id) as event_count,\n                    MAX(e.version) as max_version,\n                    COALESCE(s.version, 0) as last_snapshot_version_db -- Alias for clarity and correct field access\n                FROM events e\n                LEFT JOIN snapshots s ON e.aggregate_id = s.aggregate_id\n                GROUP BY e.aggregate_id, s.version -- Group by s.version to distinguish if there's no snapshot\n                HAVING COUNT(e.id) > $1 AND MAX(e.version) > COALESCE(s.version, 0)\n                ORDER BY COUNT(e.id) DESC\n                LIMIT $2\n                ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "aggregate_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "event_count",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "max_version",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "last_snapshot_version_db",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "35bbfc95309272b60b82e9838c1f022ca382d52f7ca92a1629057cb9a1f95fcd"
+}

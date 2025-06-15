@@ -1,5 +1,6 @@
 use crate::infrastructure::event_store::DB_POOL;
 use anyhow::Result;
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -110,6 +111,50 @@ enum ProjectionUpdate {
 // Global connection pool
 static PROJECTION_POOL: OnceCell<Arc<PgPool>> = OnceCell::const_new();
 
+#[async_trait]
+pub trait ProjectionStoreTrait: Send + Sync {
+    async fn get_account(&self, account_id: Uuid) -> Result<Option<AccountProjection>>;
+    async fn get_all_accounts(&self) -> Result<Vec<AccountProjection>>;
+    async fn get_account_transactions(
+        &self,
+        account_id: Uuid,
+    ) -> Result<Vec<TransactionProjection>>;
+    async fn upsert_accounts_batch(&self, accounts: Vec<AccountProjection>) -> Result<()>;
+    async fn insert_transactions_batch(
+        &self,
+        transactions: Vec<TransactionProjection>,
+    ) -> Result<()>;
+}
+
+#[async_trait]
+impl ProjectionStoreTrait for ProjectionStore {
+    async fn get_account(&self, account_id: Uuid) -> Result<Option<AccountProjection>> {
+        self.get_account(account_id).await
+    }
+
+    async fn get_all_accounts(&self) -> Result<Vec<AccountProjection>> {
+        self.get_all_accounts().await
+    }
+
+    async fn get_account_transactions(
+        &self,
+        account_id: Uuid,
+    ) -> Result<Vec<TransactionProjection>> {
+        self.get_account_transactions(account_id).await
+    }
+
+    async fn upsert_accounts_batch(&self, accounts: Vec<AccountProjection>) -> Result<()> {
+        self.upsert_accounts_batch(accounts).await
+    }
+
+    async fn insert_transactions_batch(
+        &self,
+        transactions: Vec<TransactionProjection>,
+    ) -> Result<()> {
+        self.insert_transactions_batch(transactions).await
+    }
+}
+
 impl ProjectionStore {
     pub fn new(pool: PgPool) -> Self {
         Self::from_pool_with_config(pool, ProjectionConfig::default())
@@ -203,23 +248,6 @@ impl ProjectionStore {
             .await?;
 
         Ok(Self::from_pool_with_config(pool.as_ref().clone(), config))
-    }
-
-    pub async fn upsert_accounts_batch(&self, accounts: Vec<AccountProjection>) -> Result<()> {
-        self.update_sender
-            .send(ProjectionUpdate::AccountBatch(accounts))
-            .map_err(|e| anyhow::anyhow!("Failed to send account batch: {}", e))?;
-        Ok(())
-    }
-
-    pub async fn insert_transactions_batch(
-        &self,
-        transactions: Vec<TransactionProjection>,
-    ) -> Result<()> {
-        self.update_sender
-            .send(ProjectionUpdate::TransactionBatch(transactions))
-            .map_err(|e| anyhow::anyhow!("Failed to send transaction batch: {}", e))?;
-        Ok(())
     }
 
     pub async fn get_account(&self, account_id: Uuid) -> Result<Option<AccountProjection>> {

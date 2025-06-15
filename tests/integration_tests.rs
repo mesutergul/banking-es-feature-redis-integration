@@ -3,10 +3,11 @@ use banking_es::{
     application::services::AccountService,
     domain::AccountError,
     infrastructure::{
-        cache_service::{CacheConfig, CacheService, EvictionPolicy},
-        event_store::EventStore,
+        cache_service::{CacheConfig, CacheService, CacheServiceTrait, EvictionPolicy},
+        event_store::{EventStore, EventStoreTrait},
         projections::{
-            AccountProjection, ProjectionConfig, ProjectionStore, TransactionProjection,
+            AccountProjection, ProjectionConfig, ProjectionStore, ProjectionStoreTrait,
+            TransactionProjection,
         },
         redis_abstraction::RealRedisClient,
         repository::AccountRepository,
@@ -190,18 +191,16 @@ async fn setup_test_environment() -> Result<TestContext, Box<dyn std::error::Err
     let redis_client_trait = RealRedisClient::new(redis_client.as_ref().clone(), None);
 
     // Initialize services with test-specific configs
-    let event_store = EventStore::new(pool.clone());
-    let projection_store = ProjectionStore::new_test(pool.clone());
-    let cache_service = CacheService::new_test(redis_client_trait);
-    let repository = Arc::new(AccountRepository::new(
-        event_store,
-        Default::default(),
-        projection_store.clone(),
-        redis_client.as_ref().clone(),
-    )?);
+    let event_store = Arc::new(EventStore::new(pool.clone())) as Arc<dyn EventStoreTrait + 'static>;
+    let projection_store = Arc::new(ProjectionStore::new_test(pool.clone()))
+        as Arc<dyn ProjectionStoreTrait + 'static>;
+    let cache_service = Arc::new(CacheService::new_test(redis_client_trait))
+        as Arc<dyn CacheServiceTrait + 'static>;
+    let repository: Arc<AccountRepository> = Arc::new(AccountRepository::new(event_store));
+    let repository_clone = repository.clone();
 
     let service = Arc::new(AccountService::new(
-        repository.clone(),
+        repository,
         projection_store,
         cache_service,
         Arc::new(Default::default()),
@@ -222,7 +221,7 @@ async fn setup_test_environment() -> Result<TestContext, Box<dyn std::error::Err
 
     Ok(TestContext {
         account_service: service,
-        account_repository: repository,
+        account_repository: repository_clone,
         db_pool: pool,
         _shutdown_tx: shutdown_tx,
         _background_tasks: background_tasks,

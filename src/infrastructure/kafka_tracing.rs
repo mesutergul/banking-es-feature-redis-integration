@@ -1,5 +1,7 @@
 use crate::domain::{Account, AccountEvent};
 use crate::infrastructure::kafka_metrics::KafkaMetrics;
+use anyhow::Result;
+use async_trait::async_trait;
 use opentelemetry::KeyValue;
 use opentelemetry_sdk::trace::{self, IdGenerator, RandomIdGenerator, Sampler};
 use opentelemetry_sdk::Resource;
@@ -11,6 +13,16 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer};
 use uuid::Uuid;
+
+#[async_trait]
+pub trait KafkaTracingTrait: Send + Sync {
+    fn init_tracing(&self) -> Result<()>;
+    fn trace_event_processing(&self, account_id: Uuid, events: &[AccountEvent], version: i64);
+    fn trace_error(&self, error: &anyhow::Error, context: &str);
+    fn trace_metrics(&self);
+    fn trace_performance_metrics(&self);
+    fn trace_recovery_operation(&self, strategy: &str, account_id: Option<Uuid>, status: &str);
+}
 
 #[derive(Clone)]
 pub struct KafkaTracing {
@@ -189,5 +201,32 @@ impl Drop for KafkaTracing {
     fn drop(&mut self) {
         // Shutdown OpenTelemetry tracer
         opentelemetry::global::shutdown_tracer_provider();
+    }
+}
+
+impl KafkaTracingTrait for KafkaTracing {
+    fn init_tracing(&self) -> Result<()> {
+        // Implementation
+        Ok(())
+    }
+
+    fn trace_event_processing(&self, account_id: Uuid, events: &[AccountEvent], version: i64) {
+        // Implementation
+    }
+
+    fn trace_error(&self, error: &anyhow::Error, context: &str) {
+        // Implementation
+    }
+
+    fn trace_metrics(&self) {
+        // Implementation
+    }
+
+    fn trace_performance_metrics(&self) {
+        // Implementation
+    }
+
+    fn trace_recovery_operation(&self, strategy: &str, account_id: Option<Uuid>, status: &str) {
+        // Implementation
     }
 }

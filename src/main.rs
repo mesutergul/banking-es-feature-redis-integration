@@ -1,6 +1,6 @@
 use crate::infrastructure::auth::{AuthConfig, AuthService};
 use crate::infrastructure::cache_service::{CacheConfig, CacheService, EvictionPolicy};
-use crate::infrastructure::event_store::EventStore;
+use crate::infrastructure::event_store::{EventStore, DB_POOL};
 use crate::infrastructure::kafka_abstraction::KafkaConfig;
 use crate::infrastructure::projections::ProjectionStore;
 use crate::infrastructure::redis_abstraction::RealRedisClient;
@@ -12,6 +12,7 @@ use axum::{http::Method, routing::IntoMakeService, Router};
 use chrono::Utc;
 use dotenv;
 use redis;
+use sqlx::PgPool;
 use std::time::Duration;
 use std::{net::SocketAddr, sync::Arc};
 use tokio::signal;
@@ -31,11 +32,12 @@ mod web;
 
 use crate::application::AccountService;
 use crate::infrastructure::middleware::RequestMiddleware;
-use crate::infrastructure::{AccountRepository, EventStoreConfig};
+use crate::infrastructure::{AccountRepository, EventStoreConfig, UserRepository};
 
 use opentelemetry::sdk::export::trace::SpanExporter;
 use opentelemetry::trace::TracerProvider;
 
+use crate::infrastructure::init::{self, ServiceContext};
 use infrastructure::config::AppConfig;
 
 #[tokio::main]
@@ -67,38 +69,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    // Initialize Redis client
-    let redis_client = Arc::new(redis::Client::open("redis://localhost:6379")?);
-    let redis_client_trait = RealRedisClient::new(redis_client.as_ref().clone(), None);
-
-    // Initialize scaling manager
-    let scaling_config = ScalingConfig {
-        min_instances: 1,
-        max_instances: 5,
-        scale_up_threshold: 0.8,
-        scale_down_threshold: 0.2,
-        cooldown_period: Duration::from_secs(300),
-        health_check_interval: Duration::from_secs(30),
-        instance_timeout: Duration::from_secs(60),
-    };
-    let scaling_manager = Arc::new(ScalingManager::new(
-        redis_client_trait.clone(),
-        scaling_config,
-    ));
-
-    // Initialize auth service
-    let auth_config = AuthConfig {
-        jwt_secret: std::env::var("JWT_SECRET").unwrap_or_else(|_| "your-secret-key".to_string()),
-        refresh_token_secret: std::env::var("REFRESH_TOKEN_SECRET")
-            .unwrap_or_else(|_| "your-refresh-secret-key".to_string()),
-        access_token_expiry: 3600,    // 1 hour
-        refresh_token_expiry: 604800, // 7 days
-        rate_limit_requests: 100,
-        rate_limit_window: 60,
-        max_failed_attempts: 5,
-        lockout_duration_minutes: 30,
-    };
-    let auth_service = Arc::new(AuthService::new(redis_client.clone(), auth_config));
+    // Initialize all services
+    let services = init::init_all_services().await?;
 
     // Register this instance
     let instance = ServiceInstance {
@@ -116,21 +88,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         shard_assignments: vec![],
         last_heartbeat: Utc::now(),
     };
-    scaling_manager.register_instance(instance).await?;
+    services.scaling_manager.register_instance(instance).await?;
 
     // Start scaling manager
-    let scaling_manager_clone = scaling_manager.clone();
+    let scaling_manager_clone = services.scaling_manager.clone();
     tokio::spawn(async move {
         if let Err(e) = scaling_manager_clone.start_scaling_manager().await {
             eprintln!("Scaling manager error: {}", e);
         }
     });
 
-    // Initialize services
-    let (service, auth_service) = web::handlers::initialize_services().await?;
-
     // Create router
-    let app = web::routes::create_router(service, auth_service);
+    let app = create_router(
+        services.account_service.clone(),
+        services.auth_service.clone(),
+    );
 
     // Start server
     let config = AppConfig::default();

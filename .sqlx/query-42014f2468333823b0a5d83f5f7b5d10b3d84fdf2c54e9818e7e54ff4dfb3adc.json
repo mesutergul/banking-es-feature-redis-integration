@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT DISTINCT aggregate_id as account_id\n            FROM events\n            ORDER BY aggregate_id\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "account_id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "42014f2468333823b0a5d83f5f7b5d10b3d84fdf2c54e9818e7e54ff4dfb3adc"
+}

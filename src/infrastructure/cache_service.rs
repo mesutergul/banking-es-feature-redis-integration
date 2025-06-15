@@ -98,6 +98,68 @@ struct WarmingState {
     accounts_to_warm: Vec<Uuid>,
 }
 
+#[async_trait]
+pub trait CacheServiceTrait: Send + Sync {
+    async fn get_account(&self, account_id: Uuid) -> Result<Option<Account>>;
+    async fn set_account(&self, account: &Account, ttl: Option<Duration>) -> Result<()>;
+    async fn delete_account(&self, account_id: Uuid) -> Result<()>;
+    async fn get_account_events(&self, account_id: Uuid) -> Result<Option<Vec<AccountEvent>>>;
+    async fn set_account_events(
+        &self,
+        account_id: Uuid,
+        events: &[(i64, AccountEvent)],
+        ttl: Option<Duration>,
+    ) -> Result<()>;
+    async fn delete_account_events(&self, account_id: Uuid) -> Result<()>;
+    async fn invalidate_account(&self, account_id: Uuid) -> Result<()>;
+    async fn warmup_cache(&self, account_ids: Vec<Uuid>) -> Result<()>;
+    fn get_metrics(&self) -> &CacheMetrics;
+}
+
+#[async_trait]
+impl CacheServiceTrait for CacheService {
+    async fn get_account(&self, account_id: Uuid) -> Result<Option<Account>> {
+        self.get_account(account_id).await
+    }
+
+    async fn set_account(&self, account: &Account, ttl: Option<Duration>) -> Result<()> {
+        self.set_account(account, ttl).await
+    }
+
+    async fn delete_account(&self, account_id: Uuid) -> Result<()> {
+        self.delete_account(account_id).await
+    }
+
+    async fn get_account_events(&self, account_id: Uuid) -> Result<Option<Vec<AccountEvent>>> {
+        self.get_account_events(account_id).await
+    }
+
+    async fn set_account_events(
+        &self,
+        account_id: Uuid,
+        events: &[(i64, AccountEvent)],
+        ttl: Option<Duration>,
+    ) -> Result<()> {
+        self.set_account_events(account_id, events, ttl).await
+    }
+
+    async fn delete_account_events(&self, account_id: Uuid) -> Result<()> {
+        self.delete_account_events(account_id).await
+    }
+
+    async fn invalidate_account(&self, account_id: Uuid) -> Result<()> {
+        self.invalidate_account(account_id).await
+    }
+
+    async fn warmup_cache(&self, account_ids: Vec<Uuid>) -> Result<()> {
+        self.warmup_cache(account_ids).await
+    }
+
+    fn get_metrics(&self) -> &CacheMetrics {
+        self.get_metrics()
+    }
+}
+
 impl CacheService {
     pub fn new(redis_client: Arc<dyn RedisClientTrait>, config: CacheConfig) -> Self {
         let shards = Arc::new(

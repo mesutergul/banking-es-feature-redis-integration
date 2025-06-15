@@ -1,10 +1,19 @@
 use crate::infrastructure::kafka_metrics::KafkaMetrics;
+use anyhow::Result;
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
 use tracing::{error, info, warn};
+
+#[async_trait]
+pub trait MonitoringDashboardTrait: Send + Sync {
+    fn record_metrics(&self);
+    fn check_alerts(&self);
+    fn update_health_status(&self);
+}
 
 #[derive(Debug, Clone)]
 pub struct MonitoringDashboard {
@@ -266,4 +275,18 @@ pub struct MetricsSummary {
     pub dlq_size: u64,
     pub active_alerts: usize,
     pub health_status: ServiceStatus,
+}
+
+impl MonitoringDashboardTrait for MonitoringDashboard {
+    fn record_metrics(&self) {
+        // Implementation
+    }
+
+    fn check_alerts(&self) {
+        // Implementation
+    }
+
+    fn update_health_status(&self) {
+        // Implementation
+    }
 }

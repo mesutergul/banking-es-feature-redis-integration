@@ -1,5 +1,4 @@
 pub mod application;
-pub mod config;
 pub mod domain;
 pub mod infrastructure;
 pub mod web;
@@ -9,6 +8,6 @@ pub use application::AccountService;
 pub use domain::AccountError;
 pub use infrastructure::repository::AccountRepositoryTrait;
 pub use infrastructure::{
-    AccountRepository, EventStore, EventStoreConfig, KafkaConfig, KafkaEventProcessor,
-    ProjectionStore,
+    config::AppConfig, AccountRepository, EventStore, EventStoreConfig, KafkaConfig,
+    KafkaEventProcessor, ProjectionStore,
 };
